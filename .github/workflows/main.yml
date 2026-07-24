@@ -1,0 +1,147 @@
+name: Build wheels
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag'
+        required: true
+        default: 'v1.0.0'
+      publish:
+        description: 'Publish to GitHub Release'
+        type: boolean
+        required: false
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Linux (glibc + musl) and Android: cross-compiled via `cross` (Docker) on one runner.
+  build-unix:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            so_name: libgemlite_linux_x86_64_gnu.so
+            wheel_tag: manylinux_2_17_x86_64
+          - target: aarch64-unknown-linux-gnu
+            so_name: libgemlite_linux_arm64_gnu.so
+            wheel_tag: manylinux_2_17_aarch64
+          - target: x86_64-unknown-linux-musl
+            so_name: libgemlite_linux_x86_64_musl.so
+            wheel_tag: musllinux_1_2_x86_64
+          - target: aarch64-unknown-linux-musl
+            so_name: libgemlite_linux_arm64_musl.so
+            wheel_tag: musllinux_1_2_aarch64
+          - target: armv7-linux-androideabi
+            so_name: libgemlite_android_armv7.so
+            wheel_tag: linux_armv7l
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: build native library
+        run: cross build --release --target ${{ matrix.target }} --jobs "$(nproc)"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: stage .so and build wheel
+        run: |
+          rm -f lib/*.so lib/*.dll
+          cp target/${{ matrix.target }}/release/libgemlite.so lib/${{ matrix.so_name }}
+          pip install build wheel
+          python -m build --wheel --outdir dist_untagged .
+          mkdir -p dist && cp dist_untagged/*.whl dist/
+          python -m wheel tags --python-tag py3 --abi-tag none \
+            --platform-tag ${{ matrix.wheel_tag }} --remove dist/*.whl
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.wheel_tag }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  # Windows (x86_64 + arm64): built natively on a Windows runner. MSVC can cross-link
+  # for aarch64-pc-windows-msvc from an x86_64 host, so no separate ARM64 machine is needed.
+  build-windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            dll_name: gemlite_windows_x86_64.dll
+            wheel_tag: win_amd64
+          - target: aarch64-pc-windows-msvc
+            dll_name: gemlite_windows_arm64.dll
+            wheel_tag: win_arm64
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: build native library
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: stage .dll and build wheel
+        run: |
+          rm -f lib/*.so lib/*.dll
+          cp target/${{ matrix.target }}/release/gemlite.dll lib/${{ matrix.dll_name }}
+          pip install build wheel
+          python -m build --wheel --outdir dist_untagged .
+          mkdir -p dist && cp dist_untagged/*.whl dist/
+          python -m wheel tags --python-tag py3 --abi-tag none \
+            --platform-tag ${{ matrix.wheel_tag }} --remove dist/*.whl
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.wheel_tag }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  release:
+    needs: [build-unix, build-windows]
+    if: github.event.inputs.publish == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.whl
+          generate_release_notes: true
+          tag_name: ${{ github.event.inputs.tag }}
