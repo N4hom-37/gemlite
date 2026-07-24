@@ -1,0 +1,23 @@
+[package]
+name = "gemlite_ffi"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "gemlite"
+crate-type = ["cdylib"]
+
+[dependencies]
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+mime_guess = "2.0"
+infer = "0.16"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "unwind"
+incremental = false
