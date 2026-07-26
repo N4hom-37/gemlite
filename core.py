@@ -27,8 +27,8 @@ from random import randint
 from json import dumps, loads
 from wcwidth import wcswidth
 from os import environ, path, get_terminal_size
-from typing import Dict, List, Optional, Union
-from ctypes import CDLL, cast, c_bool, c_char_p, c_void_p
+from typing import Dict, Iterator, List, Optional, Union
+from ctypes import CDLL, cast, c_bool, c_char_p, c_uint64, c_void_p
 
 
 class StrTools:
@@ -160,8 +160,14 @@ class _Lib:
             inst._cdll.Init.argtypes, inst._cdll.Init.restype = [c_char_p], c_bool
             # char* Ask(const char* turns_json, const char* file_paths_json)
             inst._cdll.Ask.argtypes, inst._cdll.Ask.restype = [c_char_p, c_char_p], c_void_p
-            # void FreeString(char* ptr) -- must be called on every pointer Ask() returns
+            # void FreeString(char* ptr) -- must be called on every pointer Ask()/StreamNext() returns
             inst._cdll.FreeString.argtypes, inst._cdll.FreeString.restype = [c_void_p], None
+            # uint64_t StreamStart(const char* turns_json, const char* file_paths_json) -- 0 means it failed
+            inst._cdll.StreamStart.argtypes, inst._cdll.StreamStart.restype = [c_char_p, c_char_p], c_uint64
+            # char* StreamNext(uint64_t handle) -- one {"type": "delta"|"done"|"error"|"pending"} chunk
+            inst._cdll.StreamNext.argtypes, inst._cdll.StreamNext.restype = [c_uint64], c_void_p
+            # void StreamClose(uint64_t handle) -- always call this once done iterating, even on error/cancel
+            inst._cdll.StreamClose.argtypes, inst._cdll.StreamClose.restype = [c_uint64], None
 
             cls._instance = inst
         return cls._instance
@@ -257,13 +263,54 @@ class Gemini:
             return []
         return [file_path] if isinstance(file_path, str) else list(file_path)
 
+    def _prepare_request(
+        self,
+        question: str,
+        file_path: Union[str, List[str], None],
+        use_history: Optional[bool],
+    ) -> tuple[bool, bytes, bytes]:
+        """Resolve ``use_history`` and encode the turns/paths JSON shared by Ask and StreamStart."""
+        use_history = self._enable_history if use_history is None else use_history
+        turns = (self._history if use_history else []) + [{"role": "user", "text": question}]
+        turns_json = dumps(turns).encode("utf-8")
+        paths_json = dumps(self._normalize_paths(file_path)).encode("utf-8")
+        return use_history, turns_json, paths_json
+
+    def _commit_history(self, use_history: bool, question: str, result: str) -> None:
+        if use_history:
+            self._history.append({"role": "user", "text": question})
+            self._history.append({"role": "model", "text": result})
+
+    def _decode_ptr(self, ptr: c_void_p, fn_name: str) -> dict:
+        """Cast+decode a JSON string pointer from the native side, freeing it regardless of outcome."""
+        if not ptr:
+            raise RuntimeError(f"{fn_name} returned a null pointer")
+        try:
+            raw = cast(ptr, c_char_p).value
+        finally:
+            self._lib.FreeString(ptr)
+        if not raw:
+            raise RuntimeError(f"{fn_name} returned an empty response")
+        return loads(raw.decode("utf-8"))
+
+    @staticmethod
+    def _raise_errors(errors: List[Dict[str, object]], context: str) -> None:
+        """Raise APIError (single failure) or ExceptionGroup (multiple), given a batch of error dicts."""
+        errs = [APIError(e) for e in errors]
+        if not errs:
+            raise RuntimeError(f"{context} failed with no error detail")
+        if len(errs) == 1:
+            raise errs[0]
+        raise ExceptionGroup(f"gemini {context} failed", errs)
+
     def ask(
         self,
         question: str,
         file_path: Union[str, List[str], None] = None,
         use_history: Optional[bool] = None,
-    ) -> str:
-        """Send a prompt to Gemini and return the response text.
+        stream: bool = False,
+    ) -> Union[str, Iterator[str]]:
+        """Send a prompt to Gemini.
 
         Args:
             question: The prompt to send.
@@ -272,10 +319,18 @@ class Gemini:
                 ~47 hours by the native core to avoid re-uploading).
             use_history: Whether to include and update conversation history
                 for this call. Defaults to the ``history`` setting passed to
-                the constructor.
+                the constructor. History is only updated once the full
+                response (streamed or not) has been received.
+            stream: If ``False`` (default), blocks and returns the full
+                response as a ``str``. If ``True``, returns a generator that
+                lazily yields text chunks as they arrive -- nothing is sent
+                over the network until you start iterating it. Iterate it
+                fully or ``break``/``.close()`` it early (e.g. on Ctrl-C);
+                either way the underlying stream is cleaned up automatically.
 
         Returns:
-            The model's response text.
+            The full response text, or a generator of text chunks if
+            ``stream=True``.
 
         Raises:
             APIError: if a single configured key failed.
@@ -284,33 +339,70 @@ class Gemini:
             RuntimeError: on an unexpected/empty response from the native
                 library.
         """
-        use_history = self._enable_history if use_history is None else use_history
-        turns = (self._history if use_history else []) + [{"role": "user", "text": question}]
+        if stream:
+            return self._ask_stream(question, file_path, use_history)
+        return self._ask_blocking(question, file_path, use_history)
 
-        ptr = self._lib.Ask(dumps(turns).encode("utf-8"), dumps(self._normalize_paths(file_path)).encode("utf-8"))
-        if not ptr:
-            raise RuntimeError("Ask returned a null pointer")
-        try:
-            raw = cast(ptr, c_char_p).value
-        finally:
-            # The native side allocated this string; we must free it regardless
-            # of how the block above exits.
-            self._lib.FreeString(ptr)
-        if not raw:
-            raise RuntimeError("Ask returned an empty response")
+    def _ask_blocking(
+        self,
+        question: str,
+        file_path: Union[str, List[str], None],
+        use_history: Optional[bool],
+    ) -> str:
+        use_history, turns_json, paths_json = self._prepare_request(question, file_path, use_history)
 
-        answer = loads(raw.decode("utf-8"))
+        answer = self._decode_ptr(self._lib.Ask(turns_json, paths_json), "Ask")
         if answer["status"] == "error":
-            errs = [APIError(e) for e in answer["errors"]]
-            if len(errs) == 1:
-                raise errs[0]
-            raise ExceptionGroup("gemini request failed", errs)
+            self._raise_errors(answer["errors"], "request")
 
         result: str = answer["result"]
-        if use_history:
-            self._history.append({"role": "user", "text": question})
-            self._history.append({"role": "model", "text": result})
+        self._commit_history(use_history, question, result)
         return result
+
+    def _ask_stream(
+        self,
+        question: str,
+        file_path: Union[str, List[str], None],
+        use_history: Optional[bool],
+    ) -> Iterator[str]:
+        """Generator backing ``ask(..., stream=True)``.
+
+        Only keys rejected before any content was relayed (429 quota, or an
+        invalid key) are retried against the next configured key. Once a
+        chunk has been yielded to the caller, any further failure raises
+        immediately -- the caller keeps whatever text it already received,
+        plus an ``APIError``/``ExceptionGroup`` describing what went wrong.
+        """
+        use_history, turns_json, paths_json = self._prepare_request(question, file_path, use_history)
+
+        handle = self._lib.StreamStart(turns_json, paths_json)
+        if not handle:
+            raise RuntimeError("StreamStart failed to allocate a stream handle")
+
+        collected: List[str] = []
+        try:
+            while True:
+                chunk = self._decode_ptr(self._lib.StreamNext(handle), "StreamNext")
+                kind = chunk.get("type")
+
+                if kind == "pending":
+                    continue  # nothing new yet, poll again
+                if kind == "delta":
+                    text = chunk["text"]
+                    collected.append(text)
+                    yield text
+                elif kind == "done":
+                    break
+                elif kind == "error":
+                    self._raise_errors(chunk.get("errors", []), "stream")
+                else:
+                    raise RuntimeError(f"unknown stream chunk type: {kind!r}")
+        finally:
+            # Runs on normal completion, on error, and on early
+            # break/GeneratorExit (Ctrl-C mid-loop) alike.
+            self._lib.StreamClose(handle)
+
+        self._commit_history(use_history, question, "".join(collected))
 
 
 def main() -> None:
